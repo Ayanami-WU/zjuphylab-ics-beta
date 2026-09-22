@@ -27708,22 +27708,41 @@ var APPKEY = "eb8c68399de7483abb2d8abaea0d039f";
 var dumpedKey = "7cd476ab866b49d7a9788ad9f4789495";
 var host = "http://10.203.16.55:8098/lab-course";
 var Authorization = "";
-var toData = (path, data) => {
+var isPresent = (value) => value !== "" && value !== null && value !== void 0;
+var toData = (path, data = {}) => {
   const timestamp = getTimestamp();
-  return new URLSearchParams(
-    Object.entries({
-      app_key: APPKEY,
-      timestamp,
-      sign: md5(
-        dumpedKey + path + Object.entries(data || {}).sort((a, b) => b[0] < a[0] ? 1 : -1).map((v) => v.join("")).join("") + timestamp + " " + dumpedKey
-      ),
-      ...data
-    })
-  ).toString();
+  const signData = Object.entries(data).filter(([, value]) => isPresent(value) && typeof value !== "object").sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([key, value]) => key + String(value)).join("");
+  const params = new URLSearchParams({
+    app_key: APPKEY,
+    timestamp: String(timestamp),
+    sign: md5(dumpedKey + path + signData + timestamp + " " + dumpedKey)
+  });
+  for (const [key, value] of Object.entries(data)) {
+    if (isPresent(value)) {
+      params.set(key, String(value));
+    }
+  }
+  return params.toString();
+};
+var readResponse = async (response) => {
+  const text = await response.text();
+  let result;
+  try {
+    result = JSON.parse(text);
+  } catch {
+    throw new Error(`\u63A5\u53E3\u8FD4\u56DE\u4E86\u65E0\u6CD5\u89E3\u6790\u7684\u54CD\u5E94\uFF08HTTP ${response.status}\uFF09`);
+  }
+  if (!response.ok) {
+    throw new Error(`\u63A5\u53E3\u8BF7\u6C42\u5931\u8D25\uFF08HTTP ${response.status}\uFF09`);
+  }
+  if (!result || typeof result !== "object" || !("code" in result) || typeof result.code !== "number") {
+    throw new Error("\u63A5\u53E3\u8FD4\u56DE\u683C\u5F0F\u4E0D\u7B26\u5408\u9884\u671F");
+  }
+  return result;
 };
 async function login(username, password) {
   const path = "/api/login";
-  return await fetch(host + path, {
+  const response = await fetch(host + path, {
     method: "POST",
     headers: {
       "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"
@@ -27732,52 +27751,212 @@ async function login(username, password) {
       username,
       password
     })
-  }).then((v) => v.json()).then((res) => {
-    if (res.code !== 200) {
-      console.log("Login failed. Code=", res.code, " Message=", res.message);
-      return false;
-    }
-    if (!res.data?.token) {
-      console.log("Login failed. Message=", res.message);
-      return false;
-    }
-    Authorization = res.data.token.token_type + " " + res.data.token.access_token;
-    console.log("Login success. User:", res.data.name);
-    return true;
   });
+  const result = await readResponse(response);
+  const token = result.data?.token;
+  if (result.code !== 200 || !token?.access_token || !token.token_type) {
+    Authorization = "";
+    console.error("\u767B\u5F55\u5931\u8D25\uFF1A", result.message ?? `Code=${result.code}`);
+    return false;
+  }
+  Authorization = token.token_type + " " + token.access_token;
+  return true;
 }
 function GET(path, data = {}) {
   return fetch(host + path + "?" + toData(path, data), {
     headers: {
       Authorization
     }
-  }).then((e) => {
-    return e.json();
-  });
+  }).then((response) => readResponse(response));
 }
 
 // src/toIcsEvent.ts
-var toIcsEvent = (event) => {
+var CHINA_STANDARD_TIME_OFFSET_HOURS = 8;
+var parseDate = (value) => {
+  const match = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(value.trim());
+  if (!match) {
+    throw new Error(`\u5B9E\u9A8C\u65E5\u671F\u683C\u5F0F\u65E0\u6548\uFF1A${value}`);
+  }
+  const parts = match.slice(1).map(Number);
+  const [year, month, day] = parts;
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) {
+    throw new Error(`\u5B9E\u9A8C\u65E5\u671F\u65E0\u6548\uFF1A${value}`);
+  }
+  return parts;
+};
+var parseDates = (value) => {
+  if (typeof value !== "string") {
+    throw new Error("\u5B9E\u9A8C\u65E5\u671F\u4E3A\u7A7A");
+  }
+  const values = value.split(",").map((date) => date.trim()).filter(Boolean);
+  if (values.length === 0) {
+    throw new Error("\u5B9E\u9A8C\u65E5\u671F\u4E3A\u7A7A");
+  }
+  return values.map(parseDate);
+};
+var parseTime = (value) => {
+  const match = /^(\d{1,2}):(\d{2})$/.exec(value.trim());
+  if (!match) {
+    throw new Error(`\u5B9E\u9A8C\u5F00\u59CB\u65F6\u95F4\u683C\u5F0F\u65E0\u6548\uFF1A${value}`);
+  }
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  if (hour > 23 || minute > 59) {
+    throw new Error(`\u5B9E\u9A8C\u5F00\u59CB\u65F6\u95F4\u65E0\u6548\uFF1A${value}`);
+  }
+  return [hour, minute];
+};
+var parseWeeks = (value) => {
+  if (typeof value !== "string") {
+    return [];
+  }
+  return value.split(",").map((week) => Number(week.trim())).filter((week) => Number.isInteger(week) && week > 0);
+};
+var formatWeeks = (weeks) => {
+  const uniqueWeeks = [...new Set(weeks)].sort((a, b) => a - b);
+  if (uniqueWeeks.length === 0) {
+    return "\u5468\u6B21\u672A\u77E5";
+  }
+  if (uniqueWeeks.length === 1) {
+    return `\u7B2C${uniqueWeeks[0]}\u5468`;
+  }
+  const isContinuous = uniqueWeeks.every(
+    (week, index) => index === 0 || week === uniqueWeeks[index - 1] + 1
+  );
+  return isContinuous ? `\u7B2C${uniqueWeeks[0]}-${uniqueWeeks[uniqueWeeks.length - 1]}\u5468` : `\u7B2C${uniqueWeeks.join("\u3001")}\u5468`;
+};
+var formatTermName = (termName) => {
+  const normalized = termName?.trim();
+  if (!normalized) {
+    return "\u5B66\u671F";
+  }
+  const academicYearMatch = /学年(.+?)学期/.exec(normalized);
+  if (academicYearMatch?.[1]) {
+    return academicYearMatch[1].trim();
+  }
+  const semesterMatch = /(.+?)学期$/.exec(normalized);
+  return semesterMatch?.[1]?.trim() || normalized;
+};
+var formatPeriods = (value) => {
+  const hour = Number(/^\s*(\d{1,2}):/.exec(value || "")?.[1]);
+  return Number.isFinite(hour) && hour < 12 ? "\u7B2C3-5\u8282" : "\u7B2C6-8\u8282";
+};
+var toUtcDateTime = (date, time) => {
+  const [year, month, day] = date;
+  const [hour, minute] = time;
+  const utcDate = new Date(
+    Date.UTC(
+      year,
+      month - 1,
+      day,
+      hour - CHINA_STANDARD_TIME_OFFSET_HOURS,
+      minute
+    )
+  );
+  return [
+    utcDate.getUTCFullYear(),
+    utcDate.getUTCMonth() + 1,
+    utcDate.getUTCDate(),
+    utcDate.getUTCHours(),
+    utcDate.getUTCMinutes()
+  ];
+};
+var toIcsEvent = (event, date = parseDates(event.dates)[0], options = {}) => {
+  const time = parseTime(event.times);
+  const weekText = options.weekText || formatWeeks(parseWeeks(event.select_week));
   return {
     title: event.lab_name,
-    description: event.lab_name + " @ " + event.course_name,
-    start: [
-      ...event.dates.split("-").map(Number),
-      ...event.times.split(":").map(Number)
-    ],
+    description: [
+      `\u6559\u5E08: ${event.teacher_name}`,
+      `${formatTermName(options.termName)}{${weekText}|1\u8282/\u5468} ${formatPeriods(
+        event.times
+      )}`
+    ].join("\n"),
+    start: toUtcDateTime(date, time),
+    startInputType: "utc",
+    startOutputType: "utc",
     duration: { hours: 2, minutes: 25 },
-    // This number depends.
     location: event.address,
     status: "CONFIRMED",
-    busyStatus: "BUSY",
-    organizer: { name: event.teacher_name },
-    attendees: [{ name: event.student_name }]
+    busyStatus: "BUSY"
   };
+};
+var toIcsEvents = (event, options = {}) => {
+  const dates = parseDates(event.dates);
+  const weeks = parseWeeks(event.select_week);
+  return dates.map(
+    (date, index) => toIcsEvent(event, date, {
+      termName: options.termName,
+      weekText: formatWeeks(weeks[index] ? [weeks[index]] : weeks)
+    })
+  );
 };
 
 // src/main.ts
-(async () => {
-  esm_default12.prompt([
+var outputFilename = "zjuphylab.ics";
+var formatError = (error) => {
+  if (error instanceof Error) {
+    return error.message || error.name;
+  }
+  if (typeof error === "string") {
+    return error;
+  }
+  if (error && typeof error === "object") {
+    const details = error;
+    const parts = [];
+    if (typeof details.message === "string" && details.message) {
+      parts.push(details.message);
+    }
+    if (Array.isArray(details.errors) && details.errors.length > 0) {
+      parts.push(details.errors.map(String).join("\uFF1B"));
+    }
+    if (details.path !== void 0) {
+      parts.push(`\u5B57\u6BB5\u8DEF\u5F84\uFF1A${String(details.path)}`);
+    }
+    if (parts.length > 0) {
+      return parts.join("\uFF1B");
+    }
+    try {
+      const serialized = JSON.stringify(error);
+      if (serialized && serialized !== "{}") {
+        return serialized;
+      }
+    } catch {
+    }
+  }
+  return String(error);
+};
+var runStage = async (stage, task) => {
+  try {
+    return await task();
+  } catch (error) {
+    throw new Error(`${stage}\uFF1A${formatError(error)}`);
+  }
+};
+var loadDotEnv = () => {
+  if (!fs.existsSync(".env")) {
+    return;
+  }
+  const content = fs.readFileSync(".env", "utf8");
+  for (const line of content.split(/\r?\n/)) {
+    const match = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/.exec(line);
+    if (!match || process.env[match[1]] !== void 0) {
+      continue;
+    }
+    const value = match[2];
+    process.env[match[1]] = value.length >= 2 && (value.startsWith('"') && value.endsWith('"') || value.startsWith("'") && value.endsWith("'")) ? value.slice(1, -1) : value;
+  }
+};
+var getCredentials = async () => {
+  loadDotEnv();
+  if (process.env.USERNAME && process.env.PASSWORD) {
+    return {
+      username: process.env.USERNAME.trim(),
+      password: process.env.PASSWORD
+    };
+  }
+  return esm_default12.prompt([
     {
       type: "input",
       name: "username",
@@ -27788,58 +27967,161 @@ var toIcsEvent = (event) => {
       name: "password",
       message: "Enter your password"
     }
-  ]).then(async (answers) => {
-    const loginSuccess = await login(answers.username, answers.password);
-    return answers.username;
-  }).then(async (username) => {
-    const uid = username;
-    const term = await GET("/api/terms").then((v) => {
-      return { id: v.data.content[0].id, name: v.data.content[0].name };
-    });
-    const course = await GET("/api/courses/uid", {
-      page: "-1",
-      size: "-1",
-      termId: term.id,
-      uid
-    }).then((v) => {
-      return {
-        id: v.data[0].id,
-        name: v.data[0].courseName
-      };
-    });
-    await GET("/api/course/lab/students/full", {
-      uid,
-      page: "-1",
-      size: "-1",
-      termId: term.id,
-      courseName: course.name
-    }).then((v) => {
-      ics.createEvents(
-        v.data.content.map(toIcsEvent),
-        (error, value) => {
-          if (error) {
-            console.error("Failed", error);
-            return;
-          }
-          const outputFilename = "zjuphylab.ics";
-          if (fs.existsSync(outputFilename)) {
-            return esm_default12.prompt({
-              type: "confirm",
-              name: "overwrite",
-              message: "File [" + outputFilename + "] exists. Overwrite?"
-            }).then((answers) => {
-              if (answers.overwrite) {
-                fs.writeFileSync(outputFilename, value);
-              }
-            });
-          } else {
-            fs.writeFileSync(outputFilename, value);
-          }
-        }
+  ]);
+};
+var unwrap = (response, endpoint) => {
+  if (response.code !== 200) {
+    throw new Error(
+      `${endpoint} \u8BF7\u6C42\u5931\u8D25\uFF1A${response.message ?? `Code=${response.code}`}`
+    );
+  }
+  return response.data;
+};
+var validateCalendarEvents = (events) => {
+  const errors = [];
+  events.forEach((event, index) => {
+    const label = event.title ? `\u4E8B\u4EF6 ${index + 1}\u201C${event.title}\u201D` : `\u4E8B\u4EF6 ${index + 1}`;
+    const start = event.start;
+    if (!Array.isArray(start) || start.length < 5) {
+      errors.push(`${label}\u7684 start \u4E0D\u662F\u5B8C\u6574\u7684\u65E5\u671F\u65F6\u95F4\u6570\u7EC4`);
+    } else {
+      const [year, month, day, hour, minute] = start;
+      if (![year, month, day, hour, minute].every(Number.isInteger)) {
+        errors.push(`${label}\u7684 start \u542B\u6709\u975E\u6574\u6570\u503C\uFF1A${JSON.stringify(start)}`);
+      } else if (month < 1 || month > 12 || day < 1 || day > 31 || hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+        errors.push(`${label}\u7684 start \u8D85\u51FA\u6709\u6548\u8303\u56F4\uFF1A${JSON.stringify(start)}`);
+      }
+    }
+    if (!event.duration && !event.end) {
+      errors.push(`${label}\u7F3A\u5C11 duration \u6216 end`);
+    }
+    if (event.duration) {
+      const durationValues = Object.values(event.duration).filter(
+        (value) => value !== void 0 && value !== null
       );
-    });
+      if (durationValues.some((value) => typeof value !== "number" || !Number.isFinite(value))) {
+        errors.push(`${label}\u7684 duration \u542B\u6709\u65E0\u6548\u503C\uFF1A${JSON.stringify(event.duration)}`);
+      }
+    }
+    if (event.startInputType && !["local", "utc"].includes(event.startInputType)) {
+      errors.push(`${label}\u7684 startInputType \u65E0\u6548\uFF1A${event.startInputType}`);
+    }
+    if (event.startOutputType && !["local", "utc"].includes(event.startOutputType)) {
+      errors.push(`${label}\u7684 startOutputType \u65E0\u6548\uFF1A${event.startOutputType}`);
+    }
   });
-})();
+  if (errors.length > 0) {
+    throw new Error(errors.join("\uFF1B"));
+  }
+};
+var createCalendar = async (events) => {
+  validateCalendarEvents(events);
+  const result = ics.createEvents(events);
+  if (result.error) {
+    const details = formatError(result.error);
+    throw new Error(
+      `iCalendar \u5E93\u62D2\u7EDD\u4E86\u4E8B\u4EF6\u6570\u636E\uFF1A${details === "[object Object]" ? "\u5E95\u5C42\u5E93\u672A\u63D0\u4F9B\u8BE6\u7EC6\u539F\u56E0" : details}`
+    );
+  }
+  if (!result.value) {
+    throw new Error("iCalendar \u5E93\u6CA1\u6709\u8FD4\u56DE\u5185\u5BB9");
+  }
+  return result.value;
+};
+var saveCalendar = async (value) => {
+  if (fs.existsSync(outputFilename)) {
+    const answer = await esm_default12.prompt({
+      type: "confirm",
+      name: "overwrite",
+      message: `File [${outputFilename}] exists. Overwrite?`,
+      default: true
+    });
+    if (!answer.overwrite) {
+      console.log("\u5DF2\u53D6\u6D88\u4FDD\u5B58");
+      return;
+    }
+  }
+  fs.writeFileSync(outputFilename, value, "utf8");
+  console.log(`\u6587\u4EF6 [${outputFilename}] \u5DF2\u4FDD\u5B58`);
+};
+var main = async () => {
+  const credentials = await getCredentials();
+  if (!credentials.username || !credentials.password) {
+    throw new Error("\u7528\u6237\u540D\u548C\u5BC6\u7801\u4E0D\u80FD\u4E3A\u7A7A");
+  }
+  const loginSuccess = await runStage(
+    "\u767B\u5F55\u8BF7\u6C42\u5931\u8D25",
+    () => login(credentials.username, credentials.password)
+  );
+  if (!loginSuccess) {
+    process.exitCode = 1;
+    return;
+  }
+  console.log(`\u767B\u5F55\u6210\u529F\uFF1A\u7528\u6237 ${credentials.username}`);
+  const termPage = await runStage(
+    "\u83B7\u53D6\u671F\u6B21\u5931\u8D25",
+    async () => unwrap(
+      await GET("/api/terms"),
+      "/api/terms"
+    )
+  );
+  const terms = Array.isArray(termPage?.content) ? termPage.content : [];
+  const term = terms.find(
+    (item) => item.currentTerm === 1 || String(item.currentTerm) === "1"
+  ) ?? terms[0];
+  if (!term) {
+    throw new Error("\u6CA1\u6709\u627E\u5230\u53EF\u7528\u7684\u6559\u5B66\u671F\u6B21");
+  }
+  const courses = await runStage(
+    "\u83B7\u53D6\u8BFE\u7A0B\u5931\u8D25",
+    async () => unwrap(
+      await GET("/api/courses/uid", {
+        page: "-1",
+        size: "-1",
+        termId: term.id,
+        uid: credentials.username
+      }),
+      "/api/courses/uid"
+    )
+  );
+  const course = Array.isArray(courses) ? courses[0] : void 0;
+  if (!course) {
+    throw new Error(`\u671F\u6B21\u201C${term.name}\u201D\u4E0B\u6CA1\u6709\u627E\u5230\u5B9E\u9A8C\u8BFE\u7A0B`);
+  }
+  const labPage = await runStage(
+    "\u83B7\u53D6\u5B9E\u9A8C\u5B89\u6392\u5931\u8D25",
+    async () => unwrap(
+      await GET("/api/course/lab/students/full", {
+        uid: credentials.username,
+        page: "-1",
+        size: "-1",
+        termId: term.id,
+        courseId: course.id
+      }),
+      "/api/course/lab/students/full"
+    )
+  );
+  const records = Array.isArray(labPage?.content) ? labPage.content : [];
+  if (records.length === 0) {
+    throw new Error(`\u8BFE\u7A0B\u201C${course.courseName}\u201D\u6CA1\u6709\u53EF\u5BFC\u51FA\u7684\u5B9E\u9A8C\u5B89\u6392`);
+  }
+  const events = records.flatMap((record) => {
+    try {
+      return toIcsEvents(record, { termName: term.name });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "\u672A\u77E5\u9519\u8BEF";
+      throw new Error(`\u5B9E\u9A8C\u8BB0\u5F55 ${record.id} \u65E0\u6CD5\u8F6C\u6362\uFF1A${message}`);
+    }
+  });
+  const value = await runStage("\u751F\u6210 iCalendar \u5931\u8D25", () => createCalendar(events));
+  console.log(`\u5DF2\u83B7\u53D6 ${records.length} \u6761\u5B9E\u9A8C\u8BB0\u5F55\uFF0C\u751F\u6210 ${events.length} \u4E2A\u65E5\u5386\u4E8B\u4EF6`);
+  console.log(`\u671F\u6B21\uFF1A${term.name}\uFF0C\u8BFE\u7A0B\uFF1A${course.courseName}`);
+  await runStage("\u4FDD\u5B58 iCalendar \u6587\u4EF6\u5931\u8D25", () => saveCalendar(value));
+};
+main().catch((error) => {
+  console.error("\u5904\u7406\u5931\u8D25\uFF1A", formatError(error));
+  process.exitCode = 1;
+});
 /*! Bundled license information:
 
 tmp/lib/tmp.js:
